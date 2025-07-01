@@ -86,7 +86,7 @@ public class ObjectDetectorHelper {
         switch (currentModel) {
             case MODEL_Sign4:
             default:
-                modelName = "mobilenet1.tflite";
+                modelName = "mobilenetv1.tflite";
                 break;
         }
 

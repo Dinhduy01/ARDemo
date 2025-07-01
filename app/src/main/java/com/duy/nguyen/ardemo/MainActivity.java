@@ -582,7 +582,6 @@ public class MainActivity extends AppCompatActivity
         if (errorCreatingSession) {
             return;
         }
-        frame = sharedSession.update();
         Camera camera = frame.getCamera();
         handleTap(frame, camera);
         backgroundRenderer.draw(frame);
