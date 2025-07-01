@@ -25,7 +25,6 @@ import android.util.Log;
 import android.util.Size;
 import android.view.MotionEvent;
 import android.view.Surface;
-import android.view.View;
 import android.widget.Button;
 
 import androidx.annotation.NonNull;
@@ -56,7 +55,6 @@ import com.duy.nguyen.ardemo.rendering.ObjectRenderer;
 import com.duy.nguyen.ardemo.rendering.ObjectRenderer.BlendMode;
 import com.duy.nguyen.ardemo.rendering.PlaneRenderer;
 import com.duy.nguyen.ardemo.rendering.PointCloudRenderer;
-import com.duy.nguyen.ardemo.R;
 import com.google.ar.core.exceptions.CameraNotAvailableException;
 import com.google.ar.core.exceptions.NotYetAvailableException;
 
@@ -110,6 +108,8 @@ public class MainActivity extends AppCompatActivity
     private final float[] anchorMatrix = new float[16];
     private static final float[] DEFAULT_COLOR = new float[]{0f, 0f, 0f, 0f};
     private final ArrayList<ColoredAnchor> anchors = new ArrayList<>();
+
+    private final AtomicBoolean scanRequested = new AtomicBoolean(false);
     private static final Short AUTOMATOR_DEFAULT = 0;
     private static final String AUTOMATOR_KEY = "automator";
     private final AtomicBoolean automatorRun = new AtomicBoolean(false);
@@ -260,6 +260,12 @@ public class MainActivity extends AppCompatActivity
         displayRotationHelper = new DisplayRotationHelper(this);
         tapHelper = new TapHelper(this);
         surfaceView.setOnTouchListener(tapHelper);
+
+        Button btnScan = findViewById(R.id.btn_scan);
+        btnScan.setOnClickListener(v -> {
+            scanRequested.set(true); // 2. Yêu cầu scan, xử lý sau trong GL thread
+        });
+
         objectDetectorHelper = new ObjectDetectorHelper(
                 0.5f,
                 2,
@@ -284,7 +290,6 @@ public class MainActivity extends AppCompatActivity
                         float centerX = box.centerX();
                         float centerY = box.centerY();
 
-                        // Scale từ ảnh lên screen nếu cần (nếu preview kích thước khác ảnh detect)
                         float screenX = centerX * ((float) surfaceView.getWidth() / imageWidth);
                         float screenY = centerY * ((float) surfaceView.getHeight() / imageHeight);
 
@@ -305,24 +310,6 @@ public class MainActivity extends AppCompatActivity
                     }
                 }
         );
-
-        Button btnScan = findViewById(R.id.btn_scan);
-        btnScan.setOnClickListener(v -> {
-            try {
-                Frame frame = sharedSession.update();
-                Image image = frame.acquireCameraImage();
-                Bitmap bitmap = ImageUtils.imageToBitmap(image); // bạn cần class này
-                image.close();
-
-                objectDetectorHelper.detect(bitmap, 0); // rotation nếu cần
-                lastFrame = frame; // giữ lại frame để xử lý sau khi có result
-
-            } catch (NotYetAvailableException e) {
-                Log.e(TAG, "Image not available yet", e);
-            } catch (CameraNotAvailableException e) {
-                throw new RuntimeException(e);
-            }
-        });
 
         resumeARCore();
     }
@@ -566,20 +553,36 @@ public class MainActivity extends AppCompatActivity
         }
         displayRotationHelper.updateSessionIfNeeded(sharedSession);
         try {
-            onDrawFrameARCore();
+            Frame frame = sharedSession.update();
+
+            if (scanRequested.getAndSet(false)) { // 3. Thực hiện scan nếu đã bật
+                try {
+                    Image image = frame.acquireCameraImage();
+                    Bitmap bitmap = ImageUtils.imageToBitmap(image);
+                    image.close();
+
+                    lastFrame = frame;
+                    objectDetectorHelper.detect(bitmap, 0);
+
+                } catch (NotYetAvailableException e) {
+                    Log.e(TAG, "Scan: Image not available", e);
+                }
+            }
+
+            onDrawFrameARCore(frame);
         } catch (Throwable t) {
             Log.e(TAG, "Exception on the OpenGL thread", t);
         }
     }
 
-    public void onDrawFrameARCore() throws CameraNotAvailableException {
+    public void onDrawFrameARCore(Frame frame) throws CameraNotAvailableException {
         if (!arcoreActive) {
             return;
         }
         if (errorCreatingSession) {
             return;
         }
-        Frame frame = sharedSession.update();
+        frame = sharedSession.update();
         Camera camera = frame.getCamera();
         handleTap(frame, camera);
         backgroundRenderer.draw(frame);
