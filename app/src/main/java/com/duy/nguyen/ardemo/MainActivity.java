@@ -1,6 +1,7 @@
 package com.duy.nguyen.ardemo;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
@@ -24,8 +25,14 @@ import android.util.Log;
 import android.util.Size;
 import android.view.MotionEvent;
 import android.view.Surface;
+import android.view.View;
+import android.widget.Button;
+
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+
+import com.duy.nguyen.ardemo.helpers.ImageUtils;
+import com.duy.nguyen.ardemo.helpers.ObjectDetectorHelper;
 import com.google.ar.core.Anchor;
 import com.google.ar.core.Camera;
 import com.google.ar.core.Config;
@@ -51,6 +58,9 @@ import com.duy.nguyen.ardemo.rendering.PlaneRenderer;
 import com.duy.nguyen.ardemo.rendering.PointCloudRenderer;
 import com.duy.nguyen.ardemo.R;
 import com.google.ar.core.exceptions.CameraNotAvailableException;
+import com.google.ar.core.exceptions.NotYetAvailableException;
+
+import org.tensorflow.lite.task.vision.detector.Detection;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -73,11 +83,14 @@ public class MainActivity extends AppCompatActivity
     private GLSurfaceView surfaceView;
     private Session sharedSession;
     private CameraCaptureSession captureSession;
+
+    private Frame lastFrame;
     private CameraManager cameraManager;
     private List<CaptureRequest.Key<?>> keysThatCanCauseCaptureDelaysWhenModified;
     private CameraDevice cameraDevice;
     private HandlerThread backgroundThread;
     private Handler backgroundHandler;
+    private ObjectDetectorHelper objectDetectorHelper;
     private SharedCamera sharedCamera;
     private String cameraId;
     private final AtomicBoolean shouldUpdateSurfaceTexture = new AtomicBoolean(false);
@@ -150,9 +163,9 @@ public class MainActivity extends AppCompatActivity
 
                 @Override
                 public void onConfigured(@NonNull CameraCaptureSession session) {
-                  Log.d(TAG, "Camera capture session configured.");
-                  captureSession = session;
-                  setRepeatingCaptureRequest();
+                    Log.d(TAG, "Camera capture session configured.");
+                    captureSession = session;
+                    setRepeatingCaptureRequest();
                 }
 
                 @Override
@@ -231,23 +244,87 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-      super.onCreate(savedInstanceState);
-      setContentView(R.layout.activity_main);
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
 
-      Bundle extraBundle = getIntent().getExtras();
-      if (extraBundle != null && 1 == extraBundle.getShort(AUTOMATOR_KEY, AUTOMATOR_DEFAULT)) {
-        automatorRun.set(true);
-      }
-      surfaceView = findViewById(R.id.glsurfaceview);
-      surfaceView.setPreserveEGLContextOnPause(true);
-      surfaceView.setEGLContextClientVersion(2);
-      surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
-      surfaceView.setRenderer(this);
-      surfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
-      displayRotationHelper = new DisplayRotationHelper(this);
-      tapHelper = new TapHelper(this);
-      surfaceView.setOnTouchListener(tapHelper);
-      resumeARCore();
+        Bundle extraBundle = getIntent().getExtras();
+        if (extraBundle != null && 1 == extraBundle.getShort(AUTOMATOR_KEY, AUTOMATOR_DEFAULT)) {
+            automatorRun.set(true);
+        }
+        surfaceView = findViewById(R.id.glsurfaceview);
+        surfaceView.setPreserveEGLContextOnPause(true);
+        surfaceView.setEGLContextClientVersion(2);
+        surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+        surfaceView.setRenderer(this);
+        surfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+        displayRotationHelper = new DisplayRotationHelper(this);
+        tapHelper = new TapHelper(this);
+        surfaceView.setOnTouchListener(tapHelper);
+        objectDetectorHelper = new ObjectDetectorHelper(
+                0.5f,
+                2,
+                3,
+                ObjectDetectorHelper.DELEGATE_CPU,
+                ObjectDetectorHelper.MODEL_Sign4,
+                this,
+                new ObjectDetectorHelper.DetectorListener() {
+                    @Override
+                    public void onError(String error) {
+                        Log.e(TAG, "Object detection error: " + error);
+                    }
+
+                    @Override
+                    public void onResults(List<Detection> results, long inferenceTime, int imageHeight, int imageWidth) {
+                        if (results == null || results.isEmpty()) return;
+
+                        Detection first = results.get(0);
+                        android.graphics.RectF box = first.getBoundingBox();
+                        String label = first.getCategories().get(0).getLabel();
+
+                        float centerX = box.centerX();
+                        float centerY = box.centerY();
+
+                        // Scale từ ảnh lên screen nếu cần (nếu preview kích thước khác ảnh detect)
+                        float screenX = centerX * ((float) surfaceView.getWidth() / imageWidth);
+                        float screenY = centerY * ((float) surfaceView.getHeight() / imageHeight);
+
+                        List<HitResult> hitResults = lastFrame.hitTest(screenX, screenY);
+                        for (HitResult hit : hitResults) {
+                            Trackable trackable = hit.getTrackable();
+                            if ((trackable instanceof Plane && ((Plane) trackable).isPoseInPolygon(hit.getHitPose())) ||
+                                    (trackable instanceof Point && ((Point) trackable).getOrientationMode() == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL)) {
+
+                                if (anchors.size() >= 20) {
+                                    anchors.get(0).anchor.detach();
+                                    anchors.remove(0);
+                                }
+                                anchors.add(new ColoredAnchor(hit.createAnchor(), new float[]{255f, 255f, 0f, 255f}));
+                                break;
+                            }
+                        }
+                    }
+                }
+        );
+
+        Button btnScan = findViewById(R.id.btn_scan);
+        btnScan.setOnClickListener(v -> {
+            try {
+                Frame frame = sharedSession.update();
+                Image image = frame.acquireCameraImage();
+                Bitmap bitmap = ImageUtils.imageToBitmap(image); // bạn cần class này
+                image.close();
+
+                objectDetectorHelper.detect(bitmap, 0); // rotation nếu cần
+                lastFrame = frame; // giữ lại frame để xử lý sau khi có result
+
+            } catch (NotYetAvailableException e) {
+                Log.e(TAG, "Image not available yet", e);
+            } catch (CameraNotAvailableException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        resumeARCore();
     }
 
     @Override
@@ -284,14 +361,14 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public void onPause() {
-      shouldUpdateSurfaceTexture.set(false);
-      surfaceView.onPause();
-      waitUntilCameraCaptureSessionIsActive();
-      displayRotationHelper.onPause();
-      pauseARCore();
-      closeCamera();
-      stopBackgroundThread();
-      super.onPause();
+        shouldUpdateSurfaceTexture.set(false);
+        surfaceView.onPause();
+        waitUntilCameraCaptureSessionIsActive();
+        displayRotationHelper.onPause();
+        pauseARCore();
+        closeCamera();
+        stopBackgroundThread();
+        super.onPause();
     }
 
     private void resumeARCore() {
@@ -318,14 +395,14 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
-  private void setRepeatingCaptureRequest() {
-    try {
-      captureSession.setRepeatingRequest(
-              previewCaptureRequestBuilder.build(), cameraCaptureCallback, backgroundHandler);
-    } catch (CameraAccessException e) {
-      Log.e(TAG, "Failed to set repeating request", e);
+    private void setRepeatingCaptureRequest() {
+        try {
+            captureSession.setRepeatingRequest(
+                    previewCaptureRequestBuilder.build(), cameraCaptureCallback, backgroundHandler);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Failed to set repeating request", e);
+        }
     }
-  }
 
     private void createCameraPreviewSession() {
         try {
@@ -365,54 +442,55 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
-  private void openCamera() {
-    if (cameraDevice != null) {
-      return;
-    }
-    if (!CameraPermissionHelper.hasCameraPermission(this)) {
-      CameraPermissionHelper.requestCameraPermission(this);
-      return;
-    }
-    if (sharedSession == null) {
-      try {
-        sharedSession = new Session(this, EnumSet.of(Session.Feature.SHARED_CAMERA));
-      } catch (Exception e) {
-        return;
-      }
-      errorCreatingSession = false;
-      Config config = sharedSession.getConfig();
-      config.setFocusMode(Config.FocusMode.AUTO);
-      sharedSession.configure(config);
-    }
-    sharedCamera = sharedSession.getSharedCamera();
-    cameraId = sharedSession.getCameraConfig().getCameraId();
-    Size desiredCpuImageSize = sharedSession.getCameraConfig().getImageSize();
-    cpuImageReader =
-            ImageReader.newInstance(
-                    desiredCpuImageSize.getWidth(),
-                    desiredCpuImageSize.getHeight(),
-                    ImageFormat.YUV_420_888,
-                    2);
-    cpuImageReader.setOnImageAvailableListener(this, backgroundHandler);
-    sharedCamera.setAppSurfaces(this.cameraId, Arrays.asList(cpuImageReader.getSurface()));
-    try {
-      CameraDevice.StateCallback wrappedCallback =
-              sharedCamera.createARDeviceStateCallback(cameraDeviceCallback, backgroundHandler);
-      cameraManager = (CameraManager) this.getSystemService(Context.CAMERA_SERVICE);
-      CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(this.cameraId);
-      if (Build.VERSION.SDK_INT >= 28) {
-        keysThatCanCauseCaptureDelaysWhenModified = characteristics.getAvailableSessionKeys();
-        if (keysThatCanCauseCaptureDelaysWhenModified == null) {
-
-          keysThatCanCauseCaptureDelaysWhenModified = new ArrayList<>();
+    private void openCamera() {
+        if (cameraDevice != null) {
+            return;
         }
-      }
-      captureSessionChangesPossible = false;
-      cameraManager.openCamera(cameraId, wrappedCallback, backgroundHandler);
-    } catch (CameraAccessException | IllegalArgumentException | SecurityException e) {
-      Log.e(TAG, "Failed to open camera", e);
+        if (!CameraPermissionHelper.hasCameraPermission(this)) {
+            CameraPermissionHelper.requestCameraPermission(this);
+            return;
+        }
+        if (sharedSession == null) {
+            try {
+                sharedSession = new Session(this, EnumSet.of(Session.Feature.SHARED_CAMERA));
+            } catch (Exception e) {
+                return;
+            }
+            errorCreatingSession = false;
+            Config config = sharedSession.getConfig();
+            config.setFocusMode(Config.FocusMode.AUTO);
+            sharedSession.configure(config);
+        }
+        sharedCamera = sharedSession.getSharedCamera();
+        cameraId = sharedSession.getCameraConfig().getCameraId();
+        Size desiredCpuImageSize = sharedSession.getCameraConfig().getImageSize();
+        cpuImageReader =
+                ImageReader.newInstance(
+                        desiredCpuImageSize.getWidth(),
+                        desiredCpuImageSize.getHeight(),
+                        ImageFormat.YUV_420_888,
+                        2);
+        cpuImageReader.setOnImageAvailableListener(this, backgroundHandler);
+        sharedCamera.setAppSurfaces(this.cameraId, Arrays.asList(cpuImageReader.getSurface()));
+        try {
+            CameraDevice.StateCallback wrappedCallback =
+                    sharedCamera.createARDeviceStateCallback(cameraDeviceCallback, backgroundHandler);
+            cameraManager = (CameraManager) this.getSystemService(Context.CAMERA_SERVICE);
+            CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(this.cameraId);
+            if (Build.VERSION.SDK_INT >= 28) {
+                keysThatCanCauseCaptureDelaysWhenModified = characteristics.getAvailableSessionKeys();
+                if (keysThatCanCauseCaptureDelaysWhenModified == null) {
+
+                    keysThatCanCauseCaptureDelaysWhenModified = new ArrayList<>();
+                }
+            }
+            captureSessionChangesPossible = false;
+            cameraManager.openCamera(cameraId, wrappedCallback, backgroundHandler);
+        } catch (CameraAccessException | IllegalArgumentException | SecurityException e) {
+            Log.e(TAG, "Failed to open camera", e);
+        }
     }
-  }
+
     private void closeCamera() {
         if (captureSession != null) {
             captureSession.close();
@@ -434,6 +512,7 @@ public class MainActivity extends AppCompatActivity
     public void onFrameAvailable(SurfaceTexture surfaceTexture) {
 
     }
+
     @Override
     public void onImageAvailable(ImageReader imageReader) {
         Image image = imageReader.acquireLatestImage();
@@ -479,19 +558,19 @@ public class MainActivity extends AppCompatActivity
         displayRotationHelper.onSurfaceChanged(width, height);
     }
 
-  @Override
-  public void onDrawFrame(GL10 gl) {
-    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
-    if (!shouldUpdateSurfaceTexture.get()) {
-      return;
+    @Override
+    public void onDrawFrame(GL10 gl) {
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
+        if (!shouldUpdateSurfaceTexture.get()) {
+            return;
+        }
+        displayRotationHelper.updateSessionIfNeeded(sharedSession);
+        try {
+            onDrawFrameARCore();
+        } catch (Throwable t) {
+            Log.e(TAG, "Exception on the OpenGL thread", t);
+        }
     }
-    displayRotationHelper.updateSessionIfNeeded(sharedSession);
-    try {
-      onDrawFrameARCore();
-    } catch (Throwable t) {
-      Log.e(TAG, "Exception on the OpenGL thread", t);
-    }
-  }
 
     public void onDrawFrameARCore() throws CameraNotAvailableException {
         if (!arcoreActive) {
